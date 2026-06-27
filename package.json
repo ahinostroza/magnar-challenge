@@ -1,0 +1,25 @@
+{
+  "name": "scraper-challenge",
+  "version": "1.0.0",
+  "description": "TypeScript scraper for Peruvian legal documents (Jurisprudencia PJ & OEFA)",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src/index.ts",
+    "start:oefa": "ts-node src/index.ts --site oefa",
+    "start:pj": "ts-node src/index.ts --site pj",
+    "start:dry": "ts-node src/index.ts --site oefa --dry-run",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": ["scraper", "typescript", "jurisprudencia", "oefa"],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.0",
+    "ts-node": "^10.9.0"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12"
+  }
+}
