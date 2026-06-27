@@ -4,9 +4,9 @@
  * Site: https://publico.oefa.gob.pe/repdig/consulta/consultaTfa.xhtml
  * Stack: JSF (Mojarra) + PrimeFaces 6.0
  *
- * How it works:
+ * Flow:
  * 1. GET the page → JSESSIONID cookie + javax.faces.ViewState
- * 2. POST search (empty = all) via PrimeFaces AJAX → get first page + total count
+ * 2. POST search (empty = all) via PrimeFaces AJAX → first page + total count
  * 3. Parse DataTable rows from CDATA in the AJAX XML response
  * 4. Paginate via PrimeFaces DataTable pagination AJAX requests
  * 5. Download PDFs via mojarra.jsfcljs form POST (buttonId + param_uuid per row)
@@ -17,7 +17,7 @@ import * as path from "path";
 import { HttpClient } from "../utils/http-client";
 import { logger } from "../utils/logger";
 import { saveFile, saveJson, sanitizeFilename, ensureDir, appendLine, loadJson } from "../utils/file-utils";
-import { ScrapedDocument, ScrapeProgress, ScraperConfig } from "../types";
+import { ScrapedDocument, PdfDownloadInfo, ScrapeProgress, ScraperConfig } from "../types";
 
 const CTX = "OefaScraper";
 const BASE_URL = "https://publico.oefa.gob.pe";
@@ -26,22 +26,21 @@ const FORM_ID = "listarDetalleInfraccionRAAForm";
 const DT_ID = `${FORM_ID}:dt`;
 const ROWS_PER_PAGE = 10;
 
-/** Data extracted from each row needed to download the PDF */
-interface RowPdfInfo {
-  /** e.g. "listarDetalleInfraccionRAAForm:dt:0:j_idt63" */
-  buttonId: string;
-  /** UUID passed as param_uuid */
-  uuid: string;
-}
-
 export class OefaScraper {
   private http: HttpClient;
   private viewState = "";
   private documents: ScrapedDocument[] = [];
   private config: ScraperConfig;
   private progressFile: string;
-  /** Last AJAX response XML — used to parse data without re-fetching */
+
+  /** Last AJAX response — reused to parse data without re-fetching */
   private lastAjaxResponse = "";
+
+  /**
+   * Internal map: document index → PDF download metadata.
+   * Kept separate so it never leaks into the output JSON.
+   */
+  private pdfInfoMap = new Map<number, PdfDownloadInfo>();
 
   constructor(config: ScraperConfig) {
     this.config = config;
@@ -61,7 +60,6 @@ export class OefaScraper {
     logger.info(CTX, "Starting OEFA scraper...");
     ensureDir(this.config.outputDir);
 
-    // Load previous progress if exists
     const prevProgress = loadJson<ScrapeProgress>(this.progressFile);
     const startPage = prevProgress ? prevProgress.lastCompletedPage + 1 : 0;
     if (prevProgress) {
@@ -71,7 +69,7 @@ export class OefaScraper {
     // Step 1: Initialize session
     await this.initSession();
 
-    // Step 2: Trigger search (empty = all results) — also returns page 0 data
+    // Step 2: Search — also populates lastAjaxResponse with page 0
     const { totalRecords, totalPages } = await this.triggerSearch();
     logger.info(CTX, `Found ${totalRecords} records across ${totalPages} pages`);
 
@@ -88,15 +86,13 @@ export class OefaScraper {
 
     for (let page = startPage; page < endPage; page++) {
       try {
-        // Page 0 data is already in lastAjaxResponse from triggerSearch
         if (page > 0) {
           await this.navigateToPage(page);
         }
 
-        // Parse rows from the stored AJAX response
         let pageDocuments = this.parseDataTable(this.lastAjaxResponse, page);
 
-        // Trim to max documents limit
+        // Trim to max-documents limit
         if (this.config.maxDocuments > 0) {
           const remaining = this.config.maxDocuments - this.documents.length;
           if (remaining <= 0) break;
@@ -105,7 +101,6 @@ export class OefaScraper {
 
         this.documents.push(...pageDocuments);
 
-        // Download PDFs for this page
         if (this.config.downloadPdfs) {
           await this.downloadPagePdfs(pageDocuments);
         }
@@ -123,15 +118,13 @@ export class OefaScraper {
       }
     }
 
-    // Save final results
     const outputFile = saveJson(this.config.outputDir, "oefa-documents.json", this.documents);
     logger.info(CTX, `Scraping complete. ${this.documents.length} documents saved to ${outputFile}`);
-
     return this.documents;
   }
 
   // ---------------------------------------------------------------------------
-  // Session initialization
+  // Session management
   // ---------------------------------------------------------------------------
 
   private async initSession(): Promise<void> {
@@ -150,8 +143,38 @@ export class OefaScraper {
     logger.info(CTX, `Session initialized. ViewState length: ${this.viewState.length}`);
   }
 
+  /**
+   * After a non-AJAX POST (PDF download) the JSF ViewState is invalidated.
+   * Also handles ViewState expiration during long scraping sessions.
+   * Re-GETs the page and re-triggers search to restore full state.
+   */
+  private async restoreSession(): Promise<void> {
+    logger.debug(CTX, "Restoring JSF session...");
+
+    const response = await this.http.get(PAGE_PATH);
+    if (response.status === 200) {
+      const newVS = this.extractViewState(response.data as string);
+      if (newVS) {
+        this.viewState = newVS;
+      } else {
+        logger.warn(CTX, "Could not extract ViewState during session restore");
+      }
+    }
+
+    // Re-trigger search to restore DataTable state
+    const formData = this.buildFormFields();
+    formData.append("javax.faces.partial.ajax", "true");
+    formData.append("javax.faces.source", `${FORM_ID}:btnBuscar`);
+    formData.append("javax.faces.partial.execute", "@all");
+    formData.append("javax.faces.partial.render", `${FORM_ID}:pgLista ${FORM_ID}:txtNroexp`);
+    formData.append(`${FORM_ID}:btnBuscar`, `${FORM_ID}:btnBuscar`);
+
+    const xml = await this.postAjax(formData);
+    this.lastAjaxResponse = xml;
+  }
+
   // ---------------------------------------------------------------------------
-  // Search trigger — returns page 0 data in lastAjaxResponse
+  // Search
   // ---------------------------------------------------------------------------
 
   private async triggerSearch(): Promise<{ totalRecords: number; totalPages: number }> {
@@ -171,7 +194,7 @@ export class OefaScraper {
   }
 
   // ---------------------------------------------------------------------------
-  // Pagination — stores response in lastAjaxResponse
+  // Pagination
   // ---------------------------------------------------------------------------
 
   private async navigateToPage(page: number): Promise<void> {
@@ -199,27 +222,25 @@ export class OefaScraper {
   private parseDataTable(xml: string, pageNum: number): ScrapedDocument[] {
     const documents: ScrapedDocument[] = [];
 
-    // The search response wraps the DataTable inside pgLista span
-    // The pagination response returns the DataTable directly
+    // Search response wraps DataTable inside pgLista; pagination returns it directly
     let html = this.extractCdataContent(xml, `${FORM_ID}:pgLista`);
     if (!html) {
       html = this.extractCdataContent(xml, DT_ID);
     }
     if (!html) {
-      logger.warn(CTX, `No DataTable content found in AJAX response for page ${pageNum}`);
+      logger.warn(CTX, `No DataTable content found for page ${pageNum}`);
       return documents;
     }
 
-    // Pagination responses return bare <tr> elements without <table> wrapper.
-    // Cheerio drops <tr>/<td> outside a <table>, so we wrap if needed.
+    // Pagination returns bare <tr> elements. Cheerio drops <tr>/<td> outside a
+    // <table>, so we wrap when the CDATA starts with <tr.
     const wrappedHtml = html.trimStart().startsWith("<tr")
       ? `<table><tbody>${html}</tbody></table>`
       : html;
 
     const $ = cheerio.load(wrappedHtml);
-    const rows = $("tr[data-ri]");
 
-    rows.each((_i, row) => {
+    $("tr[data-ri]").each((_i, row) => {
       const cells = $(row).find("td");
       if (cells.length < 7) return;
 
@@ -230,10 +251,14 @@ export class OefaScraper {
       const sector = $(cells[4]).text().trim();
       const nroResolucion = $(cells[5]).text().trim();
 
-      // Extract PDF download info from onclick in the last column
-      // Pattern: mojarra.jsfcljs(form, {'buttonId':'buttonId', 'param_uuid':'uuid'}, '')
+      // Extract PDF download metadata from onclick and store separately
       const archiveCell = $(cells[6]);
-      const pdfInfo = this.extractPdfInfo(archiveCell, $);
+      const pdfInfo = this.extractPdfInfo(archiveCell);
+      const hasPdf = pdfInfo !== null;
+
+      if (pdfInfo) {
+        this.pdfInfoMap.set(index, pdfInfo);
+      }
 
       documents.push({
         index,
@@ -242,53 +267,52 @@ export class OefaScraper {
         unidadFiscalizable,
         sector,
         nroResolucion,
-        pdfUrl: pdfInfo ? pdfInfo.uuid : null, // Store UUID as identifier
+        hasPdf,
         pdfDownloaded: false,
-        pdfLocalPath: null,
+        pdfFilename: null,
         error: null,
-        // Store download info as internal metadata
-        ...(pdfInfo && { _pdfButtonId: pdfInfo.buttonId, _pdfUuid: pdfInfo.uuid }),
-      } as ScrapedDocument & { _pdfButtonId?: string; _pdfUuid?: string });
+      });
     });
 
     logger.debug(CTX, `Extracted ${documents.length} documents from page ${pageNum}`);
     return documents;
   }
 
+  /**
+   * Parses the onclick handler of a PDF link to extract the JSF command button
+   * ID and the document UUID.
+   *
+   * onclick pattern:
+   *   mojarra.jsfcljs(form, {'form:dt:N:j_idtXX':'...', 'param_uuid':'UUID'}, '')
+   */
   private extractPdfInfo(
     cell: ReturnType<cheerio.CheerioAPI>,
-    $: cheerio.CheerioAPI,
-  ): RowPdfInfo | null {
+  ): PdfDownloadInfo | null {
     const link = cell.find("a");
     if (link.length === 0) return null;
 
     const onclick = link.attr("onclick") || "";
-
-    // Extract buttonId: 'listarDetalleInfraccionRAAForm:dt:N:j_idtXX'
     const buttonMatch = onclick.match(/'(listarDetalleInfraccionRAAForm:dt:\d+:j_idt\d+)'/);
-    // Extract UUID: 'param_uuid':'xxxx-xxxx-xxxx'
     const uuidMatch = onclick.match(/param_uuid':'([a-f0-9-]+)'/);
 
     if (buttonMatch && uuidMatch) {
       return { buttonId: buttonMatch[1], uuid: uuidMatch[1] };
     }
-
     return null;
   }
 
   // ---------------------------------------------------------------------------
-  // PDF Downloads — via mojarra.jsfcljs form POST
+  // PDF Downloads
   // ---------------------------------------------------------------------------
 
-  private async downloadPagePdfs(
-    documents: Array<ScrapedDocument & { _pdfButtonId?: string; _pdfUuid?: string }>,
-  ): Promise<void> {
+  private async downloadPagePdfs(documents: ScrapedDocument[]): Promise<void> {
     const pdfDir = path.join(this.config.outputDir, "pdfs");
     ensureDir(pdfDir);
 
     for (const doc of documents) {
-      if (!doc._pdfButtonId || !doc._pdfUuid) {
-        logger.debug(CTX, `No PDF download info for doc ${doc.index} (${doc.expediente})`);
+      const pdfInfo = this.pdfInfoMap.get(doc.index);
+      if (!pdfInfo) {
+        logger.debug(CTX, `No PDF available for doc ${doc.index} (${doc.expediente})`);
         continue;
       }
 
@@ -297,12 +321,12 @@ export class OefaScraper {
           `${doc.expediente}_${doc.nroResolucion}`.replace(/\//g, "-"),
         ) + ".pdf";
 
-        logger.debug(CTX, `Downloading PDF: ${filename} (uuid: ${doc._pdfUuid})`);
+        logger.debug(CTX, `Downloading PDF: ${filename}`);
 
         // mojarra.jsfcljs submits a regular (non-AJAX) form POST
         const formData = this.buildFormFields();
-        formData.append(doc._pdfButtonId, doc._pdfButtonId);
-        formData.append("param_uuid", doc._pdfUuid);
+        formData.append(pdfInfo.buttonId, pdfInfo.buttonId);
+        formData.append("param_uuid", pdfInfo.uuid);
 
         const response = await this.http.post(PAGE_PATH, formData.toString(), {
           headers: {
@@ -315,22 +339,22 @@ export class OefaScraper {
         if (response.status === 200) {
           const data = Buffer.from(response.data as ArrayBuffer);
 
-          // Verify it's actually a PDF
+          // Verify response is actually a PDF (%PDF magic bytes)
           if (data.length > 4 && data.slice(0, 4).toString("ascii") === "%PDF") {
-            const savedPath = saveFile(pdfDir, filename, data);
+            saveFile(pdfDir, filename, data);
             doc.pdfDownloaded = true;
-            doc.pdfLocalPath = savedPath;
+            doc.pdfFilename = filename;
             logger.info(CTX, `Downloaded: ${filename} (${(data.length / 1024).toFixed(0)} KB)`);
           } else {
-            throw new Error("Response is not a PDF file");
+            // Could be an HTML error page or expired session redirect
+            throw new Error("Response is not a PDF (missing %PDF header)");
           }
         } else {
           throw new Error(`HTTP ${response.status}`);
         }
 
-        // After a PDF download (non-AJAX POST), the ViewState changes.
-        // We need to re-initialize the session for subsequent downloads.
-        await this.reinitSession();
+        // Non-AJAX POST invalidates JSF ViewState — must restore
+        await this.restoreSession();
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         doc.error = msg;
@@ -338,41 +362,25 @@ export class OefaScraper {
 
         appendLine(
           path.join(this.config.outputDir, "failed-downloads.txt"),
-          `${new Date().toISOString()} | ${doc.expediente} | uuid:${doc._pdfUuid} | ${msg}`,
+          `${new Date().toISOString()} | ${doc.expediente} | ${doc.nroResolucion} | ${msg}`,
         );
 
         logger.error(CTX, `Failed to download PDF for ${doc.expediente}: ${msg}`);
+
+        // Try to restore session even after failure
+        try {
+          await this.restoreSession();
+        } catch {
+          logger.warn(CTX, "Could not restore session after download failure");
+        }
       }
     }
-  }
-
-  /**
-   * After a non-AJAX form POST (PDF download), the JSF state is invalidated.
-   * Re-GET the page and re-trigger search to restore session state.
-   */
-  private async reinitSession(): Promise<void> {
-    const response = await this.http.get(PAGE_PATH);
-    if (response.status === 200) {
-      this.viewState = this.extractViewState(response.data as string);
-    }
-
-    // Re-trigger search to restore DataTable state
-    const formData = this.buildFormFields();
-    formData.append("javax.faces.partial.ajax", "true");
-    formData.append("javax.faces.source", `${FORM_ID}:btnBuscar`);
-    formData.append("javax.faces.partial.execute", "@all");
-    formData.append("javax.faces.partial.render", `${FORM_ID}:pgLista ${FORM_ID}:txtNroexp`);
-    formData.append(`${FORM_ID}:btnBuscar`, `${FORM_ID}:btnBuscar`);
-
-    const xml = await this.postAjax(formData);
-    this.lastAjaxResponse = xml;
   }
 
   // ---------------------------------------------------------------------------
   // Common helpers
   // ---------------------------------------------------------------------------
 
-  /** Build the base form fields that every request needs */
   private buildFormFields(): URLSearchParams {
     const params = new URLSearchParams();
     params.append(FORM_ID, FORM_ID);
@@ -386,7 +394,6 @@ export class OefaScraper {
     return params;
   }
 
-  /** POST an AJAX request and update ViewState from response */
   private async postAjax(formData: URLSearchParams): Promise<string> {
     const response = await this.http.post(PAGE_PATH, formData.toString(), {
       headers: {
@@ -398,12 +405,32 @@ export class OefaScraper {
     });
 
     const xml = response.data as string;
+
+    // Detect expired session: server returns a redirect or empty response
+    if (xml.includes("ViewExpiredException") || xml.includes("session") || xml.length < 100) {
+      logger.warn(CTX, "ViewState expired — re-initializing session...");
+      await this.initSession();
+      // Retry the request with fresh ViewState
+      formData.set("javax.faces.ViewState", this.viewState);
+      const retryRes = await this.http.post(PAGE_PATH, formData.toString(), {
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "Faces-Request": "partial/ajax",
+          "X-Requested-With": "XMLHttpRequest",
+          Referer: `${BASE_URL}${PAGE_PATH}`,
+        },
+      });
+      const retryXml = retryRes.data as string;
+      this.updateViewStateFromAjax(retryXml);
+      return retryXml;
+    }
+
     this.updateViewStateFromAjax(xml);
     return xml;
   }
 
   // ---------------------------------------------------------------------------
-  // JSF/PrimeFaces helpers
+  // JSF helpers
   // ---------------------------------------------------------------------------
 
   private extractViewState(html: string): string {
@@ -415,24 +442,16 @@ export class OefaScraper {
     const match = xml.match(
       /<update\s+id="j_id1:javax\.faces\.ViewState:0"[^>]*><!\[CDATA\[([\s\S]*?)\]\]><\/update>/,
     );
-
-    if (match) {
-      this.viewState = match[1];
-      return;
-    }
+    if (match) { this.viewState = match[1]; return; }
 
     const alt = xml.match(
       /<update\s+id="javax\.faces\.ViewState"[^>]*><!\[CDATA\[([\s\S]*?)\]\]><\/update>/,
     );
-
-    if (alt) {
-      this.viewState = alt[1];
-    }
+    if (alt) { this.viewState = alt[1]; }
   }
 
   private extractCdataContent(xml: string, elementId: string): string | null {
-    // Try the ID as-is (colons are literal in the XML)
-    const escaped = this.escapeRegex(elementId);
+    const escaped = elementId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const regex = new RegExp(
       `<update\\s+id="${escaped}"[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/update>`,
     );
@@ -440,12 +459,7 @@ export class OefaScraper {
     return match ? match[1] : null;
   }
 
-  private escapeRegex(str: string): string {
-    return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
-
   private parsePaginatorInfo(xml: string): { totalRecords: number; totalPages: number } {
-    // Pattern: "Página 1 de 176 (1753 registros)"
     const match = xml.match(/P[aá]gina\s+\d+\s+de\s+(\d+)\s+\((\d+)\s+registros?\)/);
     if (match) {
       return {
@@ -454,7 +468,6 @@ export class OefaScraper {
       };
     }
 
-    // Fallback: PrimeFaces widget config
     const rowCountMatch = xml.match(/rowCount:(\d+)/);
     if (rowCountMatch) {
       const total = parseInt(rowCountMatch[1], 10);

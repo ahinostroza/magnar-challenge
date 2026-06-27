@@ -16,18 +16,22 @@ export interface ScrapedDocument {
   sector: string;
   /** Resolution number */
   nroResolucion: string;
-  /** URL to download the PDF (if available) */
-  pdfUrl: string | null;
+  /** Whether a PDF is available for this document */
+  hasPdf: boolean;
   /** Whether the PDF was successfully downloaded */
   pdfDownloaded: boolean;
-  /** Local path where PDF was saved */
-  pdfLocalPath: string | null;
+  /** Local filename where PDF was saved (relative to pdfs/) */
+  pdfFilename: string | null;
   /** Any error that occurred during processing */
   error: string | null;
-  /** @internal JSF button ID for PDF download */
-  _pdfButtonId?: string;
-  /** @internal UUID for PDF download */
-  _pdfUuid?: string;
+}
+
+/** @internal PDF download metadata — never serialized to output JSON */
+export interface PdfDownloadInfo {
+  /** JSF command button ID (e.g. "form:dt:0:j_idt63") */
+  buttonId: string;
+  /** UUID passed as param_uuid to the JSF form POST */
+  uuid: string;
 }
 
 /** A scraped document from the PJ site */
